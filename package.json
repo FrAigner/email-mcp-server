@@ -15,7 +15,7 @@
     "@modelcontextprotocol/sdk": "^1.8.0",
     "dotenv": "^16.3.1",
     "imapflow": "^1.0.142",
-    "nodemailer": "^6.9.7",
+    "nodemailer": "^10.0.12",
     "zod": "^3.24.2"
   },
   "devDependencies": {
@@ -23,6 +23,7 @@
     "@types/imapflow": "^1.0.20",
     "@types/node": "^22.13.17",
     "@types/nodemailer": "^6.4.17",
+    "tsx": "^4.23.15",
     "typescript": "^5.8.2"
   },
   "private": true
