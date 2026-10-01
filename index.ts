@@ -1,9 +1,13 @@
 #!/usr/bin/env bun
+import { normalizeSearchQuery } from "./normalizeQuery.mjs";
+import { ensureEnvelope } from "./fetchOptions.mjs";
+import { envelopeToMessage } from "./envelope.mjs";
+import { queryDate } from "./dateQuery.mjs";
 
 import dotenv from 'dotenv';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ImapFlow, type MessageAddressObject, type FetchQueryObject } from 'imapflow';
+import { ImapFlow, type FetchQueryObject } from 'imapflow';
 import nodemailer from 'nodemailer';
 import { z } from 'zod';
 
@@ -79,11 +83,6 @@ const emailConfig = {
 const createImapClient = (): ImapFlow => new ImapFlow(emailConfig.imap);
 const smtpTransporter = nodemailer.createTransport(emailConfig.smtp);
 
-const mapAddress = (addr: MessageAddressObject): EmailAddress => ({
-  name: addr.name,
-  address: addr.address || ''
-})
-
 // Tool definitions
 server.tool(
   "send_email",
@@ -145,16 +144,14 @@ let searchQuerySchema = z.object({
   subject: z.string().optional(),
   larger: z.number().int().positive().optional(),
   smaller: z.number().int().positive().optional(),
-  uid: z.string().optional(),
-  modseq: z.bigint().optional(),
-  emailId: z.string().optional(),
+  modseq: z.coerce.bigint().optional(),
   threadId: z.string().optional(),
-  before: z.date().optional(),
-  on: z.date().optional(),
-  since: z.date().optional(),
-  sentBefore: z.date().optional(),
-  sentOn: z.date().optional(),
-  sentSince: z.date().optional(),
+  before: queryDate(),
+  on: queryDate(),
+  since: queryDate(),
+  sentBefore: queryDate(),
+  sentOn: queryDate(),
+  sentSince: queryDate(),
   keyword: z.string().optional(),
   unKeyword: z.string().optional(),
   header: z.record(z.string(), z.union([z.boolean(), z.string()])).optional(),
@@ -196,8 +193,11 @@ server.tool(
       await client.mailboxOpen(folder);
 
       // Search for messages matching the query
-      const uids = await client.search(query, { uid: true });
+      const uids = await client.search(normalizeSearchQuery(query), { uid: true });
       console.log({ context: 'search_emails', uids });
+      if (!Array.isArray(uids)) {
+        throw new Error(`IMAP SEARCH failed in folder "${folder}"`);
+      }
 
       const messages: EmailMessage[] = [];
 
@@ -205,14 +205,20 @@ server.tool(
       const limitedUids = uids.slice(0, limit);
 
       if (limitedUids.length > 0) {
-        for await (const message of client.fetch(limitedUids, fetchOptions)) {
-          messages.push({
-            id: message.uid,
-            subject: message.envelope.subject,
-            from: message.envelope.from.map(mapAddress),
-            to: message.envelope.to.map(mapAddress),
-            date: message.envelope.date
-          });
+        for await (const message of client.fetch(limitedUids, ensureEnvelope(fetchOptions), { uid: true })) {
+          const msg: any = envelopeToMessage(message);
+
+          // Body-Inhalt hinzufügen, wenn source (roher Body) vorhanden ist
+          if (message.source) {
+            msg.rawBody = message.source.toString();
+          }
+
+          // bodyStructure hinzufügen, wenn angefordert
+          if (message.bodyStructure) {
+            msg.bodyStructure = message.bodyStructure;
+          }
+
+          messages.push(msg);
         }
       }
 
@@ -272,6 +278,55 @@ server.tool(
   }
 );
 
+server.tool(
+  "move_emails",
+  "Move one or more emails (by UID) from one folder to another, e.g. to Archive. Does not delete anything.",
+  {
+    uids: z.array(z.number().int().positive()).min(1),
+    folder: z.string().optional().default("INBOX"),
+    destinationFolder: z.string().min(1),
+  },
+  async ({ uids, folder, destinationFolder }) => {
+    console.log({ context: 'move_emails', uids, folder, destinationFolder });
+    const client = createImapClient();
+
+    try {
+      await client.connect();
+      await client.mailboxOpen(folder);
+
+      const result = await client.messageMove(uids, destinationFolder, { uid: true });
+      console.log({ context: 'move_emails', result });
+
+      if (!result) {
+        return {
+          content: [{ type: "text", text: `Error moving emails: IMAP server rejected the move (folder "${destinationFolder}" may not exist).` }],
+          isError: true
+        };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify(
+            { moved: uids, from: folder, to: destinationFolder, path: result.path, destination: result.destination },
+            (_key, value) => typeof value === 'bigint' ? value.toString() : value,
+            2
+          )
+        }]
+      };
+    } catch (error) {
+      console.error({ message: 'Error moving emails', error });
+      const err = error as Error;
+      return {
+        content: [{ type: "text", text: `Error moving emails: ${err.message}` }],
+        isError: true
+      };
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
 // Resource handlers
 server.resource(
   "inbox",
@@ -288,17 +343,11 @@ server.resource(
       const fetchOptions: FetchQueryObject = { envelope: true };
 
       for await (const message of client.fetch('1:*', fetchOptions)) {
-        messages.push({
-          id: message.uid,
-          subject: message.envelope.subject,
-          from: message.envelope.from.map(mapAddress),
-          to: message.envelope.to.map(mapAddress),
-          date: message.envelope.date
-        });
+        messages.push(envelopeToMessage(message));
       }
       console.log({ context: 'inbox', messages });
       // Sort by date, newest first, and limit to 10
-      messages.sort((a, b) => b.date.getTime() - a.date.getTime());
+      messages.sort((a, b) => (b.date?.getTime() ?? 0) - (a.date?.getTime() ?? 0));
       const recentMessages = messages.slice(0, 10);
 
       return {
