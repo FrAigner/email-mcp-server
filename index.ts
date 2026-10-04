@@ -27,6 +27,8 @@ const parseEnv = () => {
     IMAP_PORT: z.string().regex(/^\d+$/).transform(Number),
     SMTP_HOST: z.string().min(1),
     SMTP_PORT: z.string().regex(/^\d+$/).transform(Number),
+    // Optionaler Absender, z.B. eine eigene Domain-Adresse statt des Login-Kontos
+    EMAIL_FROM: z.string().email().optional(),
   }).parse(process.env);
 }
 const env = parseEnv();
@@ -69,6 +71,7 @@ const server = new McpServer({
 
 // Set up email configuration
 const emailUser = env.EMAIL_USER;
+const emailFrom = env.EMAIL_FROM || emailUser;
 const emailConfig = {
   imap: {
     host: env.IMAP_HOST,
@@ -132,7 +135,7 @@ registerTool(
   async ({ to, cc, bcc, subject, text, html }) => {
     try {
       const mailOptions = {
-        from: emailUser,
+        from: emailFrom,
         to,
         cc,
         bcc,
@@ -555,7 +558,7 @@ registerTool(
       const prefix = comment ? `${comment}\n\n` : '';
 
       const info = await smtpTransporter.sendMail({
-        from: emailUser,
+        from: emailFrom,
         to,
         subject: `Fwd: ${original.subject}`,
         text: prefix + header + (originalText || '(siehe HTML-Inhalt)'),
