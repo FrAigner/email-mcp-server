@@ -29,6 +29,8 @@ const parseEnv = () => {
     SMTP_PORT: z.string().regex(/^\d+$/).transform(Number),
     // Optionaler Absender, z.B. eine eigene Domain-Adresse statt des Login-Kontos
     EMAIL_FROM: z.string().email().optional(),
+    // Optionaler Anzeigename fuer den Absender, z.B. "Max Mustermann"
+    EMAIL_FROM_NAME: z.string().min(1).optional(),
   }).parse(process.env);
 }
 const env = parseEnv();
@@ -71,7 +73,10 @@ const server = new McpServer({
 
 // Set up email configuration
 const emailUser = env.EMAIL_USER;
-const emailFrom = env.EMAIL_FROM || emailUser;
+const emailFromAddress = env.EMAIL_FROM || emailUser;
+const emailFrom = env.EMAIL_FROM_NAME
+  ? { name: env.EMAIL_FROM_NAME, address: emailFromAddress }
+  : emailFromAddress;
 const emailConfig = {
   imap: {
     host: env.IMAP_HOST,
