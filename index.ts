@@ -3,6 +3,7 @@ import { normalizeSearchQuery } from "./normalizeQuery.mjs";
 import { ensureEnvelope } from "./fetchOptions.mjs";
 import { envelopeToMessage } from "./envelope.mjs";
 import { queryDate } from "./dateQuery.mjs";
+import { recipients, optionalRecipients } from "./recipients.mjs";
 import { collectAttachments, safeFilename, findBodyPart, htmlToText } from "./attachments.mjs";
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
@@ -119,18 +120,22 @@ const registerTool = (name: string, description: string, schema: any, handler: (
 // Tool definitions
 registerTool(
   "send_email",
-  "Send an email message",
+  "Send an email message. to, cc and bcc each take one address or a list of addresses.",
   {
-    to: z.string().email(),
+    to: recipients(),
+    cc: optionalRecipients(),
+    bcc: optionalRecipients(),
     subject: z.string().min(1),
     text: z.string().min(1),
     html: z.string().optional(),
   },
-  async ({ to, subject, text, html }) => {
+  async ({ to, cc, bcc, subject, text, html }) => {
     try {
       const mailOptions = {
         from: emailUser,
         to,
+        cc,
+        bcc,
         subject,
         text,
         html
@@ -143,6 +148,8 @@ registerTool(
           type: "text",
           text: JSON.stringify({
             messageId: info.messageId,
+            accepted: info.accepted,
+            rejected: info.rejected,
             status: 'Email sent successfully'
           }, null, 2)
         }]
