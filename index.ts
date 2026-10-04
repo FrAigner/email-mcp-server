@@ -3,6 +3,13 @@ import { normalizeSearchQuery } from "./normalizeQuery.mjs";
 import { ensureEnvelope } from "./fetchOptions.mjs";
 import { envelopeToMessage } from "./envelope.mjs";
 import { queryDate } from "./dateQuery.mjs";
+import { recipients, optionalRecipients } from "./recipients.mjs";
+import { collectAttachments, safeFilename, findBodyPart, htmlToText } from "./attachments.mjs";
+import { createWriteStream } from 'node:fs';
+import { mkdir } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 import dotenv from 'dotenv';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -23,6 +30,10 @@ const parseEnv = () => {
   }).parse(process.env);
 }
 const env = parseEnv();
+
+// stdout gehört exklusiv dem MCP-Protokoll (JSON-RPC). Debug-Ausgaben auf
+// stdout verstopfen/zerstören sonst den Kanal zum Client -> nach stderr.
+console.log = console.error;
 
 type EmailAddress = {
   name?: string;
@@ -66,7 +77,9 @@ const emailConfig = {
     auth: {
       user: emailUser,
       pass: env.EMAIL_PASSWORD
-    }
+    },
+    // ImapFlow loggt sonst per pino auf stdout (siehe oben)
+    logger: false as const
   },
   smtp: {
     host: env.SMTP_HOST,
@@ -83,21 +96,46 @@ const emailConfig = {
 const createImapClient = (): ImapFlow => new ImapFlow(emailConfig.imap);
 const smtpTransporter = nodemailer.createTransport(emailConfig.smtp);
 
+// Jeder Tool-Aufruf bekommt ein Zeitlimit. Hängt eine IMAP-Abfrage (z. B.
+// bestimmte fetch-Optionen), soll der Aufrufer einen Fehler bekommen statt
+// endlos zu warten.
+const RAW_BODY_MAX = 20_000;
+const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || 90_000);
+const registerTool = (name: string, description: string, schema: any, handler: (args: any) => Promise<any>) =>
+  server.tool(name, description, schema, async (args: any) => {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({
+        content: [{ type: "text", text: `Error: ${name} timed out after ${TOOL_TIMEOUT_MS / 1000}s` }],
+        isError: true
+      }), TOOL_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([handler(args), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
 // Tool definitions
-server.tool(
+registerTool(
   "send_email",
-  "Send an email message",
+  "Send an email message. to, cc and bcc each take one address or a list of addresses.",
   {
-    to: z.string().email(),
+    to: recipients(),
+    cc: optionalRecipients(),
+    bcc: optionalRecipients(),
     subject: z.string().min(1),
     text: z.string().min(1),
     html: z.string().optional(),
   },
-  async ({ to, subject, text, html }) => {
+  async ({ to, cc, bcc, subject, text, html }) => {
     try {
       const mailOptions = {
         from: emailUser,
         to,
+        cc,
+        bcc,
         subject,
         text,
         html
@@ -110,6 +148,8 @@ server.tool(
           type: "text",
           text: JSON.stringify({
             messageId: info.messageId,
+            accepted: info.accepted,
+            rejected: info.rejected,
             status: 'Email sent successfully'
           }, null, 2)
         }]
@@ -175,9 +215,9 @@ const fetchOptionsSchema = z.object({
   bodyParts: z.array(z.string()).optional(),
 })
 
-server.tool(
+registerTool(
   "search_emails",
-  "Search for emails in the inbox",
+  "Search for emails in a folder. Returns UID, subject, from, to, date. To read the text of a mail use read_email, for attachments list_attachments/download_attachment.",
   {
     query: searchQuerySchema,
     fetchOptions: fetchOptionsSchema,
@@ -209,8 +249,11 @@ server.tool(
           const msg: any = envelopeToMessage(message);
 
           // Body-Inhalt hinzufügen, wenn source (roher Body) vorhanden ist
+          // Gekürzt: Rohmails mit Anhängen sind schnell mehrere MB groß.
+          // Für den Text gibt es read_email, für Anhänge download_attachment.
           if (message.source) {
-            msg.rawBody = message.source.toString();
+            const raw = message.source.toString();
+            msg.rawBody = raw.length > RAW_BODY_MAX ? raw.slice(0, RAW_BODY_MAX) + `\n[... gekürzt, ${raw.length} Zeichen gesamt - read_email verwenden]` : raw;
           }
 
           // bodyStructure hinzufügen, wenn angefordert
@@ -240,7 +283,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerTool(
   "list_folders",
   "List all available email folders/mailboxes",
   {},
@@ -278,7 +321,7 @@ server.tool(
   }
 );
 
-server.tool(
+registerTool(
   "move_emails",
   "Move one or more emails (by UID) from one folder to another, e.g. to Archive. Does not delete anything.",
   {
@@ -319,6 +362,224 @@ server.tool(
       const err = error as Error;
       return {
         content: [{ type: "text", text: `Error moving emails: ${err.message}` }],
+        isError: true
+      };
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
+registerTool(
+  "list_attachments",
+  "List the attachments of one email (by UID): part number, filename, content type, size.",
+  {
+    uid: z.number().int().positive(),
+    folder: z.string().optional().default("INBOX"),
+  },
+  async ({ uid, folder }) => {
+    console.log({ context: 'list_attachments', uid, folder });
+    const client = createImapClient();
+
+    try {
+      await client.connect();
+      await client.mailboxOpen(folder);
+
+      const message = await client.fetchOne(String(uid), { bodyStructure: true }, { uid: true });
+      if (!message) {
+        throw new Error(`No email with UID ${uid} in folder "${folder}"`);
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(collectAttachments(message.bodyStructure), null, 2) }]
+      };
+    } catch (error) {
+      console.error({ message: 'Error listing attachments', error });
+      const err = error as Error;
+      return {
+        content: [{ type: "text", text: `Error listing attachments: ${err.message}` }],
+        isError: true
+      };
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
+registerTool(
+  "download_attachment",
+  "Download one attachment of an email (by UID and part number from list_attachments) to disk. Returns the absolute path. Defaults to ~/Downloads/icloud-mail-mcp/.",
+  {
+    uid: z.number().int().positive(),
+    part: z.string().min(1),
+    folder: z.string().optional().default("INBOX"),
+    targetDir: z.string().optional(),
+  },
+  async ({ uid, part, folder, targetDir }) => {
+    console.log({ context: 'download_attachment', uid, part, folder, targetDir });
+    const client = createImapClient();
+
+    try {
+      await client.connect();
+      await client.mailboxOpen(folder);
+
+      const { meta, content } = await client.download(String(uid), part, { uid: true });
+      if (!content) {
+        throw new Error(`Attachment part ${part} not found in email UID ${uid}`);
+      }
+
+      const dir = targetDir || path.join(os.homedir(), 'Downloads', 'icloud-mail-mcp');
+      await mkdir(dir, { recursive: true });
+      const filePath = path.join(dir, `${uid}-${safeFilename(meta?.filename || `anhang-${part}`)}`);
+      await pipeline(content, createWriteStream(filePath));
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ path: filePath, contentType: meta?.contentType, filename: meta?.filename }, null, 2) }]
+      };
+    } catch (error) {
+      console.error({ message: 'Error downloading attachment', error });
+      const err = error as Error;
+      return {
+        content: [{ type: "text", text: `Error downloading attachment: ${err.message}` }],
+        isError: true
+      };
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
+const streamToBuffer = async (stream: NodeJS.ReadableStream): Promise<Buffer> => {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Buffer));
+  return Buffer.concat(chunks);
+};
+
+registerTool(
+  "read_email",
+  "Read one email (by UID): sender, recipients, date, subject, plain-text body (HTML converted to text if needed, truncated to maxChars) and the list of attachments.",
+  {
+    uid: z.number().int().positive(),
+    folder: z.string().optional().default("INBOX"),
+    maxChars: z.number().int().positive().optional().default(20000),
+  },
+  async ({ uid, folder, maxChars }) => {
+    console.log({ context: 'read_email', uid, folder });
+    const client = createImapClient();
+
+    try {
+      await client.connect();
+      await client.mailboxOpen(folder);
+
+      const message = await client.fetchOne(String(uid), { envelope: true, bodyStructure: true }, { uid: true });
+      if (!message) {
+        throw new Error(`No email with UID ${uid} in folder "${folder}"`);
+      }
+
+      let text = '';
+      const bodyPart = findBodyPart(message.bodyStructure);
+      if (bodyPart) {
+        const { content } = await client.download(String(uid), bodyPart.part, { uid: true });
+        const body = content ? (await streamToBuffer(content)).toString('utf8') : '';
+        text = bodyPart.type === 'text/html' ? htmlToText(body) : body;
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ...envelopeToMessage(message),
+            text: text.length > maxChars ? text.slice(0, maxChars) + '\n[... gekürzt]' : text,
+            attachments: collectAttachments(message.bodyStructure),
+          }, null, 2)
+        }]
+      };
+    } catch (error) {
+      console.error({ message: 'Error reading email', error });
+      const err = error as Error;
+      return {
+        content: [{ type: "text", text: `Error reading email: ${err.message}` }],
+        isError: true
+      };
+    } finally {
+      await client.logout();
+    }
+  }
+);
+
+registerTool(
+  "forward_email",
+  "Forward an email (by UID) including all its attachments to another address. Sends immediately.",
+  {
+    uid: z.number().int().positive(),
+    to: z.string().email(),
+    folder: z.string().optional().default("INBOX"),
+    comment: z.string().optional().default(""),
+  },
+  async ({ uid, to, folder, comment }) => {
+    console.log({ context: 'forward_email', uid, to, folder });
+    const client = createImapClient();
+
+    try {
+      await client.connect();
+      await client.mailboxOpen(folder);
+
+      const message = await client.fetchOne(String(uid), { envelope: true, bodyStructure: true }, { uid: true });
+      if (!message) {
+        throw new Error(`No email with UID ${uid} in folder "${folder}"`);
+      }
+      const original = envelopeToMessage(message);
+
+      let originalText = '';
+      let originalHtml: string | undefined;
+      const bodyPart = findBodyPart(message.bodyStructure);
+      if (bodyPart) {
+        const { content } = await client.download(String(uid), bodyPart.part, { uid: true });
+        const body = content ? (await streamToBuffer(content)).toString('utf8') : '';
+        if (bodyPart.type === 'text/html') originalHtml = body; else originalText = body;
+      }
+
+      const attachments = [];
+      for (const att of collectAttachments(message.bodyStructure)) {
+        const { meta, content } = await client.download(String(uid), att.part, { uid: true });
+        if (!content) continue;
+        attachments.push({
+          filename: meta?.filename || att.filename,
+          contentType: meta?.contentType || att.contentType,
+          content: await streamToBuffer(content),
+        });
+      }
+
+      const fromText = original.from.map((a) => a.name ? `${a.name} <${a.address}>` : a.address).join(', ');
+      const header = `---------- Weitergeleitete Nachricht ----------\nVon: ${fromText}\nDatum: ${original.date}\nBetreff: ${original.subject}\n\n`;
+      const prefix = comment ? `${comment}\n\n` : '';
+
+      const info = await smtpTransporter.sendMail({
+        from: emailUser,
+        to,
+        subject: `Fwd: ${original.subject}`,
+        text: prefix + header + (originalText || '(siehe HTML-Inhalt)'),
+        html: originalHtml ? `<p>${prefix.replace(/\n/g, '<br>')}${header.replace(/\n/g, '<br>')}</p>${originalHtml}` : undefined,
+        attachments,
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            messageId: info.messageId,
+            forwarded: uid,
+            to,
+            attachments: attachments.map((a) => a.filename),
+            status: 'Email forwarded successfully'
+          }, null, 2)
+        }]
+      };
+    } catch (error) {
+      console.error({ message: 'Error forwarding email', error });
+      const err = error as Error;
+      return {
+        content: [{ type: "text", text: `Error forwarding email: ${err.message}` }],
         isError: true
       };
     } finally {
