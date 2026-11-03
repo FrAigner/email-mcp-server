@@ -36,6 +36,10 @@ A Model Context Protocol (MCP) server for email integration using IMAP and SMTP 
    IMAP_PORT=993
    SMTP_HOST=smtp.example.com
    SMTP_PORT=465
+   # optional: sender address if it differs from EMAIL_USER (e.g. a custom-domain alias)
+   EMAIL_FROM=you@your-domain.example
+   # optional: display name shown as sender
+   EMAIL_FROM_NAME=Your Name
    ```
 
 ## Usage
