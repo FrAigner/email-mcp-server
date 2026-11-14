@@ -5,7 +5,7 @@ A Model Context Protocol (MCP) server for email integration using IMAP and SMTP 
 ## Features
 
 - Read emails from IMAP mailboxes
-- Send emails via SMTP
+- Send emails via SMTP (to/cc/bcc, optional file attachments from the machine running the server)
 - Search emails
 - List email folders
 
