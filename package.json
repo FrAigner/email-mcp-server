@@ -4,6 +4,7 @@
   "main": "index.ts",
   "type": "module",
   "scripts": {
+    "test": "for f in *.test.mjs; do node \"$f\" || exit 1; done",
     "logs": "bun logs.ts --follow",
     "logs:clear": "bun logs.ts --clear"
   },

@@ -4,6 +4,7 @@ import { ensureEnvelope } from "./fetchOptions.mjs";
 import { envelopeToMessage } from "./envelope.mjs";
 import { queryDate } from "./dateQuery.mjs";
 import { recipients, optionalRecipients } from "./recipients.mjs";
+import { attachmentsSchema, resolveAttachments } from "./sendAttachments.mjs";
 import { collectAttachments, safeFilename, findBodyPart, htmlToText } from "./attachments.mjs";
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
@@ -128,7 +129,7 @@ const registerTool = (name: string, description: string, schema: any, handler: (
 // Tool definitions
 registerTool(
   "send_email",
-  "Send an email message. to, cc and bcc each take one address or a list of addresses.",
+  "Send an email message. to, cc and bcc each take one address or a list of addresses. Optional attachments: files by absolute path on the machine running this server. Sends immediately.",
   {
     to: recipients(),
     cc: optionalRecipients(),
@@ -136,9 +137,12 @@ registerTool(
     subject: z.string().min(1),
     text: z.string().min(1),
     html: z.string().optional(),
+    attachments: attachmentsSchema(),
   },
-  async ({ to, cc, bcc, subject, text, html }) => {
+  async ({ to, cc, bcc, subject, text, html, attachments }) => {
     try {
+      // Prueft Dateien vorab; wirft vor dem Senden, wenn etwas fehlt/zu gross ist
+      const resolvedAttachments = await resolveAttachments(attachments);
       const mailOptions = {
         from: emailFrom,
         to,
@@ -146,7 +150,8 @@ registerTool(
         bcc,
         subject,
         text,
-        html
+        html,
+        attachments: resolvedAttachments
       };
 
       const info = await smtpTransporter.sendMail(mailOptions);
@@ -158,6 +163,7 @@ registerTool(
             messageId: info.messageId,
             accepted: info.accepted,
             rejected: info.rejected,
+            attachments: resolvedAttachments?.map((a) => a.filename || path.basename(a.path)),
             status: 'Email sent successfully'
           }, null, 2)
         }]
