@@ -4,12 +4,14 @@ import { ensureEnvelope } from "./fetchOptions.mjs";
 import { envelopeToMessage } from "./envelope.mjs";
 import { queryDate } from "./dateQuery.mjs";
 import { recipients, optionalRecipients } from "./recipients.mjs";
+import { saveSentCopy, DEFAULT_SENT_FOLDER } from "./sentCopy.mjs";
 import { attachmentsSchema, resolveAttachments } from "./sendAttachments.mjs";
 import { collectAttachments, safeFilename, findBodyPart, htmlToText } from "./attachments.mjs";
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import dotenv from 'dotenv';
@@ -102,6 +104,9 @@ const emailConfig = {
 };
 
 // Create IMAP client and SMTP transporter functions (to create fresh connections when needed)
+// Ordner fuer Kopien gesendeter Mails (iCloud: "Sent Messages")
+const sentFolder = process.env.SENT_FOLDER || DEFAULT_SENT_FOLDER;
+const newMessageId = () => `<${randomUUID()}@${(env.EMAIL_FROM || env.EMAIL_USER).split('@')[1]}>`;
 const createImapClient = (): ImapFlow => new ImapFlow(emailConfig.imap);
 const smtpTransporter = nodemailer.createTransport(emailConfig.smtp);
 
@@ -151,10 +156,14 @@ registerTool(
         subject,
         text,
         html,
-        attachments: resolvedAttachments
+        attachments: resolvedAttachments,
+        // feste Id/Datum, damit die Kopie im Gesendet-Ordner dem Original gleicht
+        messageId: newMessageId(),
+        date: new Date(),
       };
 
       const info = await smtpTransporter.sendMail(mailOptions);
+      const sentCopy = await saveSentCopy(createImapClient, mailOptions, sentFolder);
 
       return {
         content: [{
@@ -164,6 +173,7 @@ registerTool(
             accepted: info.accepted,
             rejected: info.rejected,
             attachments: resolvedAttachments?.map((a) => a.filename || path.basename(a.path)),
+            sentCopy,
             status: 'Email sent successfully'
           }, null, 2)
         }]
@@ -568,14 +578,18 @@ registerTool(
       const header = `---------- Weitergeleitete Nachricht ----------\nVon: ${fromText}\nDatum: ${original.date}\nBetreff: ${original.subject}\n\n`;
       const prefix = comment ? `${comment}\n\n` : '';
 
-      const info = await smtpTransporter.sendMail({
+      const forwardOptions = {
         from: emailFrom,
         to,
         subject: `Fwd: ${original.subject}`,
         text: prefix + header + (originalText || '(siehe HTML-Inhalt)'),
         html: originalHtml ? `<p>${prefix.replace(/\n/g, '<br>')}${header.replace(/\n/g, '<br>')}</p>${originalHtml}` : undefined,
         attachments,
-      });
+        messageId: newMessageId(),
+        date: new Date(),
+      };
+      const info = await smtpTransporter.sendMail(forwardOptions);
+      const sentCopy = await saveSentCopy(createImapClient, forwardOptions, sentFolder);
 
       return {
         content: [{
@@ -585,6 +599,7 @@ registerTool(
             forwarded: uid,
             to,
             attachments: attachments.map((a) => a.filename),
+            sentCopy,
             status: 'Email forwarded successfully'
           }, null, 2)
         }]
